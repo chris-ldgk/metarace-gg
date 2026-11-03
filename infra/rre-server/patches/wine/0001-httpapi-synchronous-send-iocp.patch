@@ -1,0 +1,174 @@
+From: RaceRoom OCI contributors
+Subject: [PATCH] httpapi: Suppress IOCP packets for private synchronous send operations.
+
+Use an event with its low bit set for internal synchronous send operations,
+and wait for pending I/O before letting the stack OVERLAPPED go out of scope.
+Keep caller-provided asynchronous OVERLAPPED completion behavior unchanged.
+
+Extend the completion-port test to cover synchronous response headers and
+body sends on a queue already associated with an application completion port.
+
+Diagnostic candidate for RaceRoom/.NET AccessViolationException; not yet
+validated as the cause of that application crash. Based on Wine wine-11.0.
+
+diff --git a/dlls/httpapi/httpapi_main.c b/dlls/httpapi/httpapi_main.c
+--- a/dlls/httpapi/httpapi_main.c
++++ b/dlls/httpapi/httpapi_main.c
+@@ -375,6 +375,36 @@
+     sprintf(buffer + strlen(buffer), "Date: %s, %02u %s %u %02u:%02u:%02u GMT\r\n",
+             day_names[date.wDayOfWeek], date.wDay, month_names[date.wMonth - 1],
+             date.wYear, date.wHour, date.wMinute, date.wSecond);
++}
++
++/* A synchronous caller must not receive an IOCP notification for our private
++ * OVERLAPPED. In particular, a CLR completion worker cannot unpack it as a
++ * managed NativeOverlapped. Keep it alive until the operation has finished. */
++static ULONG send_response_ioctl(HANDLE queue, struct http_response *buffer, ULONG size, OVERLAPPED *ovl)
++{
++    OVERLAPPED sync_ovl = {0};
++    HANDLE event = NULL;
++    DWORD transferred;
++    ULONG ret = ERROR_SUCCESS;
++
++    if (!ovl)
++    {
++        if (!(event = CreateEventW(NULL, TRUE, FALSE, NULL)))
++            return GetLastError();
++        sync_ovl.hEvent = (HANDLE)((ULONG_PTR)event | 1);
++        ovl = &sync_ovl;
++    }
++
++    if (!DeviceIoControl(queue, IOCTL_HTTP_SEND_RESPONSE, buffer, size, NULL, 0, NULL, ovl))
++        ret = GetLastError();
++
++    if (event)
++    {
++        if (ret == ERROR_IO_PENDING)
++            ret = GetOverlappedResult(queue, ovl, &transferred, TRUE) ? ERROR_SUCCESS : GetLastError();
++        CloseHandle(event);
++    }
++    return ret;
+ }
+ 
+ /***********************************************************************
+@@ -419,7 +449,6 @@
+     };
+ 
+     struct http_response *buffer;
+-    OVERLAPPED dummy_ovl = {};
+     ULONG ret = ERROR_SUCCESS;
+     int len, body_len = 0;
+     char *p, dummy[12];
+@@ -505,12 +534,7 @@
+         p += chunk->FromMemory.BufferLength;
+     }
+ 
+-    if (!ovl)
+-        ovl = &dummy_ovl;
+-
+-    if (!DeviceIoControl(queue, IOCTL_HTTP_SEND_RESPONSE, buffer,
+-            offsetof(struct http_response, buffer[len]), NULL, 0, NULL, ovl))
+-        ret = GetLastError();
++    ret = send_response_ioctl(queue, buffer, offsetof(struct http_response, buffer[len]), ovl);
+ 
+     free(buffer);
+     return ret;
+@@ -542,7 +566,6 @@
+        HTTP_LOG_DATA *log_data)
+ {
+     struct http_response *buffer;
+-    OVERLAPPED dummy_ovl = {};
+     ULONG ret = NO_ERROR;
+     int len = 0;
+     char *p;
+@@ -586,16 +609,9 @@
+         p += chunk->FromMemory.BufferLength;
+     }
+ 
+-    if (!ovl)
+-    {
+-        ovl = &dummy_ovl;
+-        if (ret_size)
+-            *ret_size = len;
+-    }
+-
+-    if (!DeviceIoControl(queue, IOCTL_HTTP_SEND_RESPONSE, buffer,
+-            offsetof(struct http_response, buffer[len]), NULL, 0, NULL, ovl))
+-        ret = GetLastError();
++    ret = send_response_ioctl(queue, buffer, offsetof(struct http_response, buffer[len]), ovl);
++    if (!ovl && !ret && ret_size)
++        *ret_size = len;
+ 
+     free(buffer);
+     return ret;
+diff --git a/dlls/httpapi/tests/httpapi.c b/dlls/httpapi/tests/httpapi.c
+--- a/dlls/httpapi/tests/httpapi.c
++++ b/dlls/httpapi/tests/httpapi.c
+@@ -370,6 +370,9 @@
+     char DECLSPEC_ALIGN(8) req_buffer[2048], response_buffer[2048];
+     HTTP_REQUEST_V1 *req = (HTTP_REQUEST_V1 *)req_buffer;
+     HTTP_RESPONSE_V1 response = {};
++    HTTP_DATA_CHUNK chunk = {0};
++    DWORD timeout = 2000;
++    unsigned int header_len;
+     unsigned short tcp_port;
+     OVERLAPPED ovl, *povl;
+     HANDLE queue, port;
+@@ -431,6 +434,57 @@
+     ret = recv(s, response_buffer, sizeof(response_buffer), 0);
+     ok(ret == ret_size, "Expected size %lu, got %u.\n", ret_size, ret);
+ 
++    /* Private OVERLAPPED structures from synchronous sends must not reach
++     * the application's completion port. Real asynchronous receives still do. */
++    ret = HttpReceiveHttpRequest(queue, HTTP_NULL_ID, 0, (HTTP_REQUEST *)req, sizeof(req_buffer), NULL, &ovl);
++    ok(ret == ERROR_IO_PENDING, "Got error %u.\n", ret);
++    ret = send(s, req_text, strlen(req_text), 0);
++    ok(ret == strlen(req_text), "send() returned %d.\n", ret);
++    ret = GetQueuedCompletionStatus(port, &ret_size, &key, &povl, 2000);
++    ok(ret, "Receive completion failed, error %lu.\n", GetLastError());
++    ok(povl == &ovl, "Unexpected receive OVERLAPPED %p.\n", povl);
++    if (!ret || povl != &ovl) goto cleanup;
++
++    response.Headers.KnownHeaders[HttpHeaderContentLength].pRawValue = "4";
++    response.Headers.KnownHeaders[HttpHeaderContentLength].RawValueLength = 1;
++    ret = HttpSendHttpResponse(queue, req->RequestId, HTTP_SEND_RESPONSE_FLAG_MORE_DATA,
++            (HTTP_RESPONSE *)&response, NULL, NULL, NULL, 0, NULL, NULL);
++    ok(!ret, "Synchronous headers returned %u.\n", ret);
++    if (ret) goto cleanup;
++    ret = GetQueuedCompletionStatus(port, &ret_size, &key, &povl, 100);
++    ok(!ret && GetLastError() == WAIT_TIMEOUT && !povl,
++            "Unexpected synchronous header completion: ret %d, error %lu, overlapped %p.\n",
++            ret, GetLastError(), povl);
++
++    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
++    for (header_len = 0; header_len < sizeof(response_buffer);)
++    {
++        ret = recv(s, response_buffer + header_len, 1, 0);
++        ok(ret == 1, "Receiving headers failed, error %u.\n", WSAGetLastError());
++        if (ret != 1) goto cleanup;
++        ++header_len;
++        if (header_len >= 4 && !memcmp(response_buffer + header_len - 4, "\r\n\r\n", 4)) break;
++    }
++    ok(header_len < sizeof(response_buffer), "Response headers too large.\n");
++    if (header_len == sizeof(response_buffer)) goto cleanup;
++
++    chunk.DataChunkType = HttpDataChunkFromMemory;
++    chunk.FromMemory.pBuffer = (void *)"test";
++    chunk.FromMemory.BufferLength = 4;
++    ret_size = 0xdeadbeef;
++    ret = HttpSendResponseEntityBody(queue, req->RequestId, 0, 1, &chunk, &ret_size, NULL, 0, NULL, NULL);
++    ok(!ret, "Synchronous body returned %u.\n", ret);
++    ok(ret_size == 4, "Expected 4 body bytes, got %lu.\n", ret_size);
++    if (ret) goto cleanup;
++    ret = GetQueuedCompletionStatus(port, &ret_size, &key, &povl, 100);
++    ok(!ret && GetLastError() == WAIT_TIMEOUT && !povl,
++            "Unexpected synchronous body completion: ret %d, error %lu, overlapped %p.\n",
++            ret, GetLastError(), povl);
++    ret = recv(s, response_buffer, 4, MSG_WAITALL);
++    ok(ret == 4, "Expected 4 received bytes, got %d.\n", ret);
++    if (ret == 4) ok(!memcmp(response_buffer, "test", 4), "Unexpected response body.\n");
++
++cleanup:
+     ret = remove_url_v1(queue, tcp_port);
+     ok(!ret, "Got error %u.\n", ret);
+     closesocket(s);
