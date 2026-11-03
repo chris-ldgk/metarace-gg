@@ -17,3 +17,5 @@
 - Whether service-token requests carry `Cf-Access-Jwt-Assertion`
 
 Sources: developers.cloudflare.com/workers-vpc/ (overview, get-started, vpc-services, vpc-networks, tunnel, limits, pricing, changelog), blog.cloudflare.com/workers-vpc-open-beta/, cloudflare-one service-tokens & account-limits, queues pull-consumers.
+
+**Product decision (2026-11-03):** D-079 supersedes D-028 — Cloudflare Tunnel + an Access service token is the primary control path, and VPC is optional until it reaches GA. The fallback sketched above still names D1 for host selection; D1 was dropped in D-046, so that data lives in KV or Postgres.
