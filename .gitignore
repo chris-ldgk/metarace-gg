@@ -32,3 +32,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 
 # Finder (MacOS) folder config
 .DS_Store
+
+# rust build output
+infra/rre-server/manager/target
+
+# proprietary server input
+infra/rre-server/manager/data/*.exe

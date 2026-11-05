@@ -1,23 +1,29 @@
 # RRE dedicated server image
 
-Our own Linux image for the RaceRoom dedicated server (Steam app 354060). It does
-**not** build on `procinger/r3e-oci`; the multi-stage Dockerfile produces every
-piece from pinned upstream inputs.
+Our Linux image for the RaceRoom dedicated server. One container runs one
+manager and one game server:
+
+- **`metarace-rre-manager`** (Rust, native) replaces the Windows
+  `RRRE_Dedicated.exe` manager (D-081). It registers a slave with the RaceRoom
+  portal at boot, creates the server settings there and announces the server so
+  it appears in the **in-game server browser** (D-087). It owns the game
+  process, state and result callbacks; see [manager/API.md](manager/API.md).
+- **`DedicatedServer.exe`** still runs under **GE-Proton Wine**, extracted from
+  the game payload embedded in the manager at build time.
+- **No SteamCMD, .NET 4.8 prefix, nginx or patched `httpapi.dll` at runtime.**
+  The image is built from pinned upstreams and starts in seconds.
+
+For the two-host production layout see [PRODUCTION.md](PRODUCTION.md).
 
 ## What the build does
 
-1. **`httpapi-build` stage** — downloads Valve's Wine at the revision GE-Proton 11
-   ships, applies the synchronous-send `httpapi` patch, and compiles only
-   `dlls/httpapi/x86_64-windows/httpapi.dll`.
-2. **`runtime` stage** — installs a pinned GE-Proton release (SHA-512 checked),
-   overlays the patched `httpapi.dll`, installs SteamCMD and Winetricks, then:
-   - installs app 354060 anonymously into `/opt/raceroom/server`;
-   - creates the .NET Framework 4.8 Wine prefix with `winetricks -q dotnet48`
-     and bakes it as `/opt/raceroom/dotnet48-prefix.tar`.
-
-At startup nothing is downloaded. The entrypoint copies the baked server into
-`/data/server` if the volume is empty, extracts the prefix on first boot, and
-starts nginx plus the manager under Xvfb.
+1. **`server`** — installs Steam app 354060 anonymously with SteamCMD and keeps
+   only `RRRE_Dedicated.exe` (the manager) for its embedded game payload.
+2. **`manager-build`** — extracts `CommunityMultiplayer.Game.game.zip` from that
+   executable and builds the Rust manager with the payload embedded.
+3. **`runtime`** — installs GE-Proton (SHA-512 verified) and the Wine libraries,
+   bakes a plain `wineboot` prefix, and copies the manager. Nothing is
+   downloaded at startup.
 
 ## Build
 
@@ -25,55 +31,75 @@ starts nginx plus the manager under Xvfb.
 docker build -t metarace/rre-server infra/rre-server
 ```
 
-The build needs network access for the Wine source, GE-Proton (565 MB), SteamCMD,
-the server and the .NET installer. Use `--build-arg RRE_BUILD_STAMP=$(date +%F)`
-to force a fresh SteamCMD download without `--no-cache`.
-
-The image has not been built on this workstation (no Docker in WSL). The
-individual steps were executed and verified by hand against the same pinned
-versions; the first image build should be done on a Docker host and smoke-tested.
+The build needs network access for SteamCMD, the server and GE-Proton. The
+SteamCMD layer is cached until the Dockerfile changes.
 
 ## Run
 
+One container per split (D-083). The manager auto-starts from the supplied
+settings and the orchestrator drives it over the control API.
+
 ```bash
 docker run --rm -t --name rre \
-  -e ADMIN_USERNAME=admin -e ADMIN_PASSWORD=admin \
-  -p 127.0.0.1:8080:8080 \
+  -e METARACE_PORTAL_SECRET='...' \
+  -e METARACE_CONTROL_TOKEN='...' \
+  -e METARACE_RUN_ID='race-42-split-1' \
+  -e METARACE_SERVER_ID='split-1' \
+  -e METARACE_RESULT_URL='https://api.metarace.gg/internal/rre/results' \
+  -e METARACE_RESULT_TOKEN='...' \
+  -e METARACE_SETTINGS_FILE=/run/secrets/settings.json \
+  -v "$PWD/settings.json:/run/secrets/settings.json:ro" \
+  -p 127.0.0.1:8088:8088 \
   -p 60000-60014:60000-60014/udp \
   -p 60000-60014:60000-60014/tcp \
-  -v rre-data:/data \
   metarace/rre-server
 ```
 
-- `-t` is required: RaceRoom with native .NET needs a console.
-- The manager is on `http://localhost:8080` (nginx, basic auth). The API is
-  `:8088` inside the container.
-- One manager runs **up to 5 live servers**, the quota per (public IP, secret).
-  Each server consumes three consecutive ports: game UDP, game TCP = +1, time
-  UDP = +2. The manager allocates them monotonically from 60000 and resets the
-  counter on restart, so give each container its own IP or use a base-port
-  mechanism if you run several on one host.
-- Direct API clients must send `Host: localhost:8088`; the manager's HttpListener
-  matches that prefix. nginx already sets it.
+- A unique `METARACE_PORTAL_SECRET` per container gives an independent quota.
+  The manager takes the portal's port allocation; `METARACE_GAME_PORT` overrides
+  it only when the container mapping matches the returned port.
+- The game server takes three consecutive ports (game UDP, game TCP = +1, time
+  UDP = +2) inside the portal-allocated block. The block is not necessarily
+  60000 — publish the 60000-60014 range (or the allocated block) and let the
+  gateway DNAT the same range.
+- The manager passes the container's IPv4 as `-ip` automatically; set
+  `METARACE_DEDI_IP` if the container has several addresses. Without it the game
+  server binds IPv6-only and the IPv4 Docker/gateway path is unreachable.
+- Players join through the server browser with the password in the settings.
+  The direct `rrre://` URI is not a supported join path (S-7 failed).
+- `-t` is retained from the previous image. The Rust manager does not need a
+  console; keep the TTY until the game server has been verified without one.
+- `/data` is ephemeral: the game payload is re-extracted in about a second per
+  container, and results are pushed out before teardown.
+- A crashed game server is **not** restarted. The orchestrator detects it via
+  `/state` and voids the split (D-008).
 
 ## Environment
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `UPDATE_ON_START` | `false` | `true` re-runs SteamCMD at boot; leave `false` for immutable splits |
-| `SERVER_EXE` | `RRRE_Dedicated.exe` | manager executable name |
-| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | unset | enables nginx basic auth |
-| `RRE_SERVER_DIR` | `/data/server` | where the server is provisioned/updated |
+| Variable | Purpose |
+|---|---|
+| `METARACE_SETTINGS` / `METARACE_SETTINGS_FILE` | RRE server settings JSON (required) |
+| `METARACE_PORTAL_SECRET` | slave secret; required unless the portal is disabled |
+| `METARACE_PORTAL_DISABLED` | `true` for a private server with no registration |
+| `METARACE_CONTROL_TOKEN` | bearer token for `/state`, `/stop`, `/results` |
+| `METARACE_GAME_PORT` | overrides the portal's port allocation |
+| `METARACE_RESULT_URL` / `METARACE_RESULT_TOKEN` | result ingest endpoint |
+| `METARACE_RUN_ID` / `METARACE_SERVER_ID` | forwarded with each result |
+| `METARACE_LOG_LEVEL` | defaults to `info` |
 
-## Operational caveats
+The full list is in [manager/API.md](manager/API.md).
 
-- Starting a server persisted from a previous manager run crashes the manager
-  (`AccessViolationException` after unimplemented `httpapi.HttpCancelHttpRequest`).
-  The orchestrator must delete persisted IDs on boot and recreate (D-042).
-- Killing a game server makes the manager restart it on the same port; `/dedi`
-  is briefly stale, so health checks need PID stability plus session progress
-  (D-034).
-- Game logs are encrypted; use `GET /dedi` and
-  `drive_c/users/steamuser/AppData/Local/Sector3_Studios_AB/logs/output.log`.
+## Verification status
 
-See `THIRD-PARTY.md` for attribution and `testbed/` for a no-Docker runner.
+**Browser listing and join verified on `autumn` on 2026-11-05** with the Rust
+manager: portal slave registration, settings creation, announcement and a real
+client joining with the per-split password. The evidence, schema and failure
+modes are in [`../.product/research/rre-rust-manager.md`](../../.product/research/rre-rust-manager.md).
+
+The **slimmed runtime** still needs one clean production-Dockerfile run on
+`autumn` (the test image reused the previously baked `RRRE_Dedicated.exe`
+because SteamCMD anonymous login kept retrying). In particular, confirm the game
+server starts without the .NET prefix, the `httpapi` patch, nginx or Xvfb, and
+measure the clean T-5 boot-to-listed time.
+
+See `THIRD-PARTY.md` for attribution.

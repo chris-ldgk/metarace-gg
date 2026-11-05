@@ -2,3 +2,5 @@ testbed/
 README.md
 THIRD-PARTY.md
 **/__pycache__
+manager/target/
+manager/data/

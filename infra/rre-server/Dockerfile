@@ -1,79 +1,20 @@
 # syntax=docker/dockerfile:1
-# Own Linux image for the RaceRoom dedicated server (Steam app 354060).
-# No dependency on the procinger/r3e-oci image: the patched httpapi.dll is
-# built from the pinned Wine revision, and SteamCMD, the server and the .NET
-# Framework 4.8 prefix are all produced at build time.
+# Metarace RaceRoom dedicated-server image.
 #
-# Approach and the httpapi patch are adapted from procinger/r3e-oci (MIT);
-# see THIRD-PARTY.md.
-
+# The Windows manager (RRRE_Dedicated.exe) is replaced by the Rust manager in
+# manager/. The proprietary game payload is extracted from the manager at build
+# time and embedded into the Rust binary; only DedicatedServer.exe runs under
+# Wine at runtime.
+#
+# Build context: infra/rre-server
 ARG PROTON_VERSION=GE-Proton11-11
-ARG WINE_REVISION=c53678ab22a85f0fad3588dd34f0452a463bd015
-
-###### httpapi-build
-FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS httpapi-build
-ARG PROTON_VERSION
-ARG WINE_REVISION
-ARG BUILD_JOBS=4
-
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-# The patch targets wine-11.0. Keep the Wine revision in sync with the
-# GE-Proton release, or the DLL will not match the runtime.
-RUN set -eu \
-    && test "$PROTON_VERSION" = "GE-Proton11-11" \
-    && test "$WINE_REVISION" = "c53678ab22a85f0fad3588dd34f0452a463bd015"
-
-# hadolint ignore=DL3008
-RUN set -eu \
-    && export DEBIAN_FRONTEND=noninteractive \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        autoconf \
-        bison \
-        flex \
-        ca-certificates \
-        curl \
-        git \
-        pkg-config \
-        python3 \
-        gcc-mingw-w64-x86-64 \
-        g++-mingw-w64-x86-64 \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /src/wine
-RUN set -eu \
-    && curl -fsSL --retry 3 \
-        "https://codeload.github.com/ValveSoftware/wine/tar.gz/${WINE_REVISION}" \
-        | tar -xz --strip-components=1
-
-RUN set -eu \
-    && autoreconf -f \
-    && tools/make_requests \
-    && dlls/winevulkan/make_vulkan \
-    && tools/make_specfiles
-
-WORKDIR /build/wine64
-RUN set -eu \
-    && /src/wine/configure --enable-win64 --without-x --without-freetype
-
-COPY patches/wine/0001-httpapi-synchronous-send-iocp.patch /tmp/httpapi.patch
-RUN set -eu \
-    && git -C /src/wine apply --check /tmp/httpapi.patch \
-    && git -C /src/wine apply /tmp/httpapi.patch \
-    && make -C /build/wine64 -j"${BUILD_JOBS}" dlls/httpapi/x86_64-windows/httpapi.dll \
-    && mkdir -p /out \
-    && cp /build/wine64/dlls/httpapi/x86_64-windows/httpapi.dll /out/httpapi.dll
-
-###### runtime
-FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
-ARG PROTON_VERSION
-ARG WINETRICKS_VERSION=20260125
-ARG WINETRICKS_REVISION=b76e1ee79ac57d7aceb384f74518fc423265810c
 ARG STEAMCMD_URL=https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz
-ARG RRE_BUILD_STAMP=2026-11-03
 
+###### server
+# Fetch the RaceRoom dedicated server for its embedded game payload. Nothing
+# from this stage except RRRE_Dedicated.exe reaches the final image.
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS server
+ARG STEAMCMD_URL
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # hadolint ignore=DL3008
@@ -83,30 +24,141 @@ RUN set -eu \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
-        cabextract \
         curl \
-        fonts-liberation \
         lib32gcc-s1 \
         lib32stdc++6 \
-        libasound2t64 libasound2t64:i386 \
-        libgl1 libgl1:i386 \
-        libvulkan1 libvulkan1:i386 \
-        libwine libwine:i386 \
-        nginx \
-        openssl \
-        python3 \
-        tini \
-        unzip \
-        xauth \
-        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu \
     && mkdir -p /opt/steamcmd \
     && curl -fsSL --retry 3 "$STEAMCMD_URL" | tar -xz -C /opt/steamcmd
 
-# GE-Proton supplies the Wine runtime and the 32-bit support that the .NET
-# installer needs. Verify the release archive against its published SHA-512.
+RUN set -eu \
+    && userdel -r ubuntu 2>/dev/null || true \
+    && useradd --uid 1000 --create-home --shell /bin/bash steam \
+    && mkdir -p /server \
+    && chown -R steam:steam /opt/steamcmd /server
+
+USER steam
+ENV HOME=/home/steam
+
+# A fresh SteamCMD cache can answer "Missing configuration" on the first
+# login; retry, but never continue after an incomplete installation.
+RUN set -eu \
+    && for attempt in 1 2 3; do \
+         if /opt/steamcmd/steamcmd.sh \
+              +@ShutdownOnFailedCommand 1 \
+              +@NoPromptForPassword 1 \
+              +@sSteamCmdForcePlatformType windows \
+              +@sSteamCmdForcePlatformBitness 64 \
+              +force_install_dir /server \
+              +login anonymous \
+              +app_info_update 1 \
+              +app_update 354060 validate \
+              +quit; then \
+           test -f /server/RRRE_Dedicated.exe && exit 0; \
+         fi; \
+         echo "SteamCMD attempt ${attempt}/3 failed" >&2; \
+       done; \
+       exit 1
+
+###### manager-build
+FROM rust:1.99-bookworm AS manager-build
+WORKDIR /src
+
+COPY manager/ /src/manager/
+COPY --from=server /server/RRRE_Dedicated.exe /src/RRRE_Dedicated.exe
+
+RUN set -eu \
+    && CARGO_TARGET_DIR=/src/target \
+       METARACE_DEDICATED_EXE=/src/RRRE_Dedicated.exe \
+       cargo build --release --manifest-path /src/manager/Cargo.toml
+
+###### runtime
+FROM ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c AS runtime
+ARG PROTON_VERSION
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Wine runtime libraries for a 64-bit prefix. The .NET 4.8 / httpapi pieces the
+# old Windows manager needed are deliberately absent: the manager is native and
+# the game server is a native x64 binary.
+# hadolint ignore=DL3008
+RUN set -eu \
+    && export DEBIAN_FRONTEND=noninteractive \
+    && dpkg --add-architecture i386 \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        fonts-liberation \
+        libasound2t64 \
+        libasound2t64:i386 \
+        libc6-i386 \
+        libc6:i386 \
+        libdbus-1-3 \
+        libdbus-1-3:i386 \
+        libfontconfig1 \
+        libfreetype6 \
+        libfreetype6:i386 \
+        libgcc-s1:i386 \
+        libgl1 \
+        libgl1:i386 \
+        libgl1-mesa-dri \
+        libglx-mesa0 \
+        libgnutls30t64 \
+        libgnutls30t64:i386 \
+        libice6 \
+        libldap2 \
+        libldap2:i386 \
+        libpulse0 \
+        libpulse0:i386 \
+        libsasl2-2 \
+        libsasl2-2:i386 \
+        libsm6 \
+        libsndfile1 \
+        libsndfile1:i386 \
+        libstdc++6 \
+        libstdc++6:i386 \
+        libvulkan1 \
+        libvulkan1:i386 \
+        libx11-6 \
+        libx11-6:i386 \
+        libx11-xcb1 \
+        libxau6 \
+        libxcb1 \
+        libxcomposite1 \
+        libxcomposite1:i386 \
+        libxcursor1 \
+        libxcursor1:i386 \
+        libxdamage1 \
+        libxdamage1:i386 \
+        libxext6 \
+        libxext6:i386 \
+        libxfixes3 \
+        libxfixes3:i386 \
+        libxi6 \
+        libxi6:i386 \
+        libxinerama1 \
+        libxinerama1:i386 \
+        libxkbcommon0 \
+        libxkbcommon0:i386 \
+        libxrandr2 \
+        libxrandr2:i386 \
+        libxrender1 \
+        libxrender1:i386 \
+        libxxf86vm1 \
+        libxxf86vm1:i386 \
+        tar \
+        tini \
+        xauth \
+        xvfb \
+        zlib1g \
+        zlib1g:i386 \
+    && rm -rf /var/lib/apt/lists/*
+
+# GE-Proton supplies the Wine runtime. Verify the release against its
+# published SHA-512.
 WORKDIR /tmp
 RUN set -eu \
     && release_url="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/${PROTON_VERSION}" \
@@ -118,73 +170,51 @@ RUN set -eu \
     && tar -xzf "$archive" -C /opt/proton --strip-components=1 \
     && rm -f "$archive" "${PROTON_VERSION}-x86_64.sha512sum"
 
-COPY --from=httpapi-build /out/httpapi.dll /opt/proton/files/lib/wine/x86_64-windows/httpapi.dll
-
-RUN set -eu \
-    && curl -fsSL --retry 3 \
-        "https://raw.githubusercontent.com/Winetricks/winetricks/${WINETRICKS_REVISION}/src/winetricks" \
-        -o /usr/local/bin/winetricks \
-    && grep -Fx "WINETRICKS_VERSION=${WINETRICKS_VERSION}" /usr/local/bin/winetricks \
-    && chmod 755 /usr/local/bin/winetricks
-
 RUN set -eu \
     && userdel -r ubuntu 2>/dev/null || true \
     && useradd --uid 1000 --create-home --shell /bin/bash steam \
     && install -o steam -g steam -m 0644 /dev/null /etc/machine-id \
-    && mkdir -p /data /opt/raceroom \
-    && chown -R steam:steam /opt/steamcmd /opt/raceroom /data
+    && mkdir -p /data/home /data/results /data/logs \
+    && chown -R steam:steam /data
 
 ENV HOME=/data/home \
-    STEAM_COMPAT_CLIENT_INSTALL_PATH=/opt/steamcmd \
-    STEAM_COMPAT_DATA_PATH=/data/compatdata \
-    WINEPREFIX=/data/dotnet48 \
-    SteamAppId=354060 \
-    SteamGameId=354060 \
-    PROTON_USE_WINED3D=1 \
+    WINEPREFIX=/data/wineprefix \
+    METARACE_WINE_PREFIX=/data/wineprefix \
+    METARACE_DATA_DIR=/data \
+    METARACE_BIND=0.0.0.0:8088 \
+    METARACE_GAME_LAUNCHER=wine \
+    METARACE_WINEBOOT_BIN=wine \
+    PATH=/opt/proton/files/bin:/usr/local/bin:/usr/bin:/bin \
     WINEDEBUG=-all \
-    WINEDLLOVERRIDES=mscoree=n,b \
-    UPDATE_ON_START=false \
-    SERVER_EXE=RRRE_Dedicated.exe
+    PROTON_USE_WINED3D=1 \
+    SteamAppId=354060 \
+    SteamGameId=354060
 
+# Bake a plain Wine prefix (no .NET, no winetricks) so an ephemeral container
+# does not pay wineboot at boot.
+RUN set -eu \
+    && mkdir -p "$WINEPREFIX" "$HOME" \
+    && env WINEDEBUG=-all WINEDLLOVERRIDES=mscoree,mshtml=d \
+       xvfb-run -a /opt/proton/files/bin/wine wineboot -u \
+    && /opt/proton/files/bin/wineserver -w \
+    && chown -R steam:steam "$WINEPREFIX" "$HOME" \
+    && tar -cf /opt/wineprefix.tar -C "$WINEPREFIX" . \
+    && test -s /opt/wineprefix.tar \
+    && rm -rf "$WINEPREFIX" \
+    && : > /etc/machine-id
+
+COPY --from=manager-build /src/target/release/metarace-rre-manager /usr/local/bin/metarace-rre-manager
 COPY --chmod=755 scripts/entrypoint.sh /usr/local/bin/entrypoint
-COPY scripts/nginx.conf /etc/raceroom-nginx.conf
 
 USER 1000:1000
 WORKDIR /data
 
-# Bake the server outside /data. The entrypoint copies it into an empty volume
-# at startup, so bind mounts and emptyDir volumes both work.
-RUN set -eu \
-    && echo "server build ${RRE_BUILD_STAMP}" \
-    && export RRE_SERVER_DIR=/opt/raceroom/server \
-    && source /usr/local/bin/entrypoint \
-    && prepare_machine_id \
-    && prepare_directories \
-    && install_server \
-    && check_server_executable \
-    && rm -rf "$HOME/Steam/logs" "$HOME/Steam/appcache/httpcache"
-
-# Bake the .NET Framework 4.8 prefix once. At runtime the entrypoint extracts
-# this tar into WINEPREFIX, so no network access is needed on startup.
-RUN set -eu \
-    && source /usr/local/bin/entrypoint \
-    && mkdir -p "$HOME" "$WINEPREFIX" \
-    && env WINE=/opt/proton/files/bin/wine \
-             WINESERVER=/opt/proton/files/bin/wineserver \
-             WINEDLLOVERRIDES=mscoree=d \
-             xvfb-run -a winetricks -q dotnet48 \
-    && /opt/proton/files/bin/wineserver -w \
-    && tar -cf /opt/raceroom/dotnet48-prefix.tar -C "$WINEPREFIX" . \
-    && test -s /opt/raceroom/dotnet48-prefix.tar \
-    && rm -rf "$WINEPREFIX" "$HOME/.cache/winetricks" \
-    && : > /etc/machine-id
+# The portal allocates the game port block (game UDP, game TCP = +1, time UDP
+# = +2); the orchestrator publishes the 60000-60014 range or the allocated block.
+EXPOSE 8088/tcp 60000-60014/udp 60000-60014/tcp
 
 LABEL org.opencontainers.image.title="metarace/rre-server" \
-      org.opencontainers.image.description="RaceRoom dedicated server under GE-Proton Wine" \
+      org.opencontainers.image.description="Metarace RaceRoom dedicated server (Rust manager, GE-Proton)" \
       org.opencontainers.image.source="https://github.com/chris-ldgk/metarace-gg"
-
-# Each live server uses three consecutive ports: game UDP, game TCP = +1,
-# time UDP = +2. One manager is licensed for five live servers, 60000-60014.
-EXPOSE 8080/tcp 60000-60014/udp 60000-60014/tcp
 
 ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/usr/local/bin/entrypoint"]
